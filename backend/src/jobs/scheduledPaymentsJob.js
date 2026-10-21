@@ -20,6 +20,7 @@ const db = require('../db');
 const { sendPayment } = require('../services/stellar');
 const logger = require('../utils/logger');
 const { withLock } = require('../utils/distributedLock');
+const { buildFeeBreakdown, collectPlatformFee } = require('../services/fees');
 
 const LOCK_KEY = 'lock:scheduled_payments';
 const LOCK_TTL = parseInt(process.env.SCHEDULED_JOB_LOCK_TTL_SECS || '55', 10);
@@ -53,20 +54,22 @@ async function processOne(payment) {
 
   const { encrypted_secret_key } = walletResult.rows[0];
 
+  const feeBreakdown = await buildFeeBreakdown(payment.amount, payment.asset);
   const { transactionHash, ledger } = await sendPayment({
     senderPublicKey: payment.sender_wallet,
     encryptedSecretKey: encrypted_secret_key,
     recipientPublicKey: payment.recipient_wallet,
-    amount: payment.amount,
+    amount: feeBreakdown.net_amount,
     asset: payment.asset,
     memo: payment.memo,
   });
 
   await db.query(
-    `INSERT INTO transactions (sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status)
-     VALUES ($1, $2, $3, $4, $5, $6, 'completed')`,
-    [payment.sender_wallet, payment.recipient_wallet, payment.amount, payment.asset, payment.memo, transactionHash]
+    `INSERT INTO transactions (sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, fee_amount, fee_breakdown)
+     VALUES ($1, $2, $3, $4, $5, $6, 'completed', $7, $8)`,
+    [payment.sender_wallet, payment.recipient_wallet, payment.amount, payment.asset, payment.memo, transactionHash, feeBreakdown.platform_fee_amount, JSON.stringify(feeBreakdown)]
   );
+  collectPlatformFee(feeBreakdown, payment.sender_wallet);
 
   // Advance the schedule for recurring payments instead of marking them
   // completed after the first execution. This keeps the job in sync with
