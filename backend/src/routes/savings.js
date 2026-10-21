@@ -1,6 +1,7 @@
 const express = require('express');
 const { body, param, validationResult } = require('express-validator');
 const auth = require('../middleware/auth');
+const { requireStepUp } = require('../middleware/requireStepUp');
 const { create, list, withdraw, getWithdrawQuote } = require('../controllers/savingsController');
 
 const router = express.Router();
@@ -52,6 +53,7 @@ router.post(
       .withMessage('Invalid lock period'),
   ],
   validate,
+  requireStepUp,
   create
 );
 
@@ -93,6 +95,7 @@ router.post(
     param('id').isUUID().withMessage('Invalid vault ID'),
   ],
   validate,
+  requireStepUp,
   withdraw
 );
 
