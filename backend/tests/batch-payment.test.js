@@ -8,6 +8,23 @@ jest.mock('../src/services/stellar', () => ({
   findPaymentPath: jest.fn(),
   fetchFee: jest.fn(),
 }));
+jest.mock('../src/services/fees', () => ({
+  buildFeeBreakdown: jest.fn(async (gross, asset) => {
+    const fee = Number((Number(gross) * 250 / 10000).toFixed(7));
+    const net = Number((Number(gross) - fee).toFixed(7));
+    return {
+      gross_amount: Number(gross),
+      gross_amount_usdc: Number(gross),
+      platform_fee_bps: 250,
+      platform_fee_amount: fee,
+      platform_fee_usdc: fee,
+      net_amount: net,
+      net_amount_usdc: net,
+      asset,
+    };
+  }),
+  collectPlatformFee: jest.fn(),
+}));
 jest.mock('../src/services/memoRequired', () => ({
   isMemoRequired: jest.fn(),
 }));
@@ -25,6 +42,7 @@ jest.mock('../src/utils/cache', () => ({
 const express = require('express');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
+const StellarSdk = require('@stellar/stellar-sdk');
 const db = require('../src/db');
 const authMiddleware = require('../src/middleware/auth');
 const idempotency = require('../src/middleware/idempotency');
@@ -57,7 +75,7 @@ const USER_ID = 'test-user-id';
 const TOKEN = jwt.sign({ userId: USER_ID }, process.env.JWT_SECRET, { expiresIn: '1h' });
 const SENDER = 'GCSEQ5XE5YYKPITLT63FZ7LCW2JZNYVP3L2XKMGELRKGPNZXNNBVPOU3';
 const VALID_RECIPIENT = 'GCUB4U3E5AXUY2OJOFKQGDL2ZIEAFHAXNERCZ4EEKF2J6IFIK7KYYPUI';
-const INVALID_RECIPIENT = 'GDV3A7XU2I7GQFLSM7ORWPH4YJTL7SIEO76DJ5OJW3YBAJBRVUGPIL2B';
+const INVALID_RECIPIENT = StellarSdk.Keypair.random().publicKey();
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -96,8 +114,11 @@ test('returns a per-recipient breakdown when some rows fail validation', async (
   expect(response.status).toBe(200);
   expect(sendBatchPayment).toHaveBeenCalledWith(expect.objectContaining({
     asset: 'USDC',
-    recipients: [{ index: 0, recipientPublicKey: VALID_RECIPIENT, amount: '10' }],
+    recipients: [expect.objectContaining({ index: 0, recipientPublicKey: VALID_RECIPIENT, amount: 9.75 })],
   }));
+  const insertCall = db.query.mock.calls.find(([sql]) => sql.includes('INSERT INTO transactions'));
+  expect(insertCall[1][10]).toBe(0.25);
+  expect(JSON.parse(insertCall[1][11])).toMatchObject({ platform_fee_amount: 0.25, net_amount: 9.75 });
   expect(response.body.summary).toEqual({
     total: 2,
     submitted: 1,

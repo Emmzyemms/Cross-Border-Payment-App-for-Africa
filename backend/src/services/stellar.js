@@ -638,7 +638,13 @@ async function _sendPaymentOnce({
         { label: 'submitTransaction(payment)' }
       );
       const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(payment)');
-      return { transactionHash: result.hash, ledger: result.ledger, type: 'payment' };
+      return {
+        transactionHash: result.hash,
+        ledger: result.ledger,
+        type: 'payment',
+        successful: result.successful,
+        maxTime: transaction.timeBounds?.maxTime,
+      };
     } catch (err) {
       if (isBadSeq(err) && attempt < MAX_SEQ_RETRIES - 1) {
         logger.warn('tx_bad_seq detected, retrying with fresh sequence number', {
@@ -1060,7 +1066,12 @@ async function sendPathPayment({
       () => withFallback(s => s.submitTransaction(transaction), 'submitTransaction'),
       { label: 'submitTransaction(pathPayment)' }
     );
-    return { transactionHash: result.hash, ledger: result.ledger };
+    return {
+      transactionHash: result.hash,
+      ledger: result.ledger,
+      successful: result.successful,
+      maxTime: transaction.timeBounds?.maxTime,
+    };
   }, senderPublicKey, senderKeypair);
 }
 
@@ -1117,7 +1128,12 @@ async function sendStrictReceivePathPayment({
 
   const rawResult = await withFallback(s => s.submitTransaction(transaction));
   const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(strictReceive)');
-  return { transactionHash: result.hash, ledger: result.ledger };
+  return {
+    transactionHash: result.hash,
+    ledger: result.ledger,
+    successful: result.successful,
+    maxTime: transaction.timeBounds?.maxTime,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1665,6 +1681,7 @@ module.exports = {
   setAccountFlags,
   findReceivePath,
   sendStrictReceivePathPayment,
+  withFallback,
   isBadSeq,
   recoverSequence,
   withSequenceRecovery,

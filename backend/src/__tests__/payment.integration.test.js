@@ -414,7 +414,7 @@ describe('POST /api/payments/send — success', () => {
       senderPublicKey:    SENDER_KEY,
       encryptedSecretKey: ENCRYPTED_SECRET,
       recipientPublicKey: RECIPIENT_KEY,
-      amount:             '5',
+      amount:             '4.875',
       asset:              'XLM',
       memo:               'school fees',
       memoType:           'text'
@@ -460,6 +460,8 @@ describe('POST /api/payments/send — success', () => {
     expect(params[3]).toBe('10');
     expect(params[4]).toBe('XLM');
     expect(params[7]).toBe(FAKE_TX_HASH);
+    expect(params[15]).toBe(0.25);
+    expect(JSON.parse(params[14])).toMatchObject({ gross_amount: 10, platform_fee_amount: 0.25, net_amount: 9.75 });
   });
 
   test('stores null memo when memo is not provided', async () => {
