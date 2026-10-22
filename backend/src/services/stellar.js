@@ -25,6 +25,10 @@ const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
 const networkPassphrase = isTestnet
   ? StellarSdk.Networks.TESTNET
   : StellarSdk.Networks.PUBLIC;
+const CLAIMABLE_BALANCE_EXPIRY_DAYS = Math.max(
+  1,
+  parseInt(process.env.CLAIMABLE_BALANCE_EXPIRY_DAYS || '30', 10) || 30,
+);
 
 /**
  * Validate that a transaction's network passphrase matches the configured network.
@@ -475,6 +479,69 @@ async function resolveFederationAddress(address) {
 // Claimable balance (fallback for non-existent recipient accounts)
 // ---------------------------------------------------------------------------
 
+async function getEffectsForTransaction(transactionHash) {
+  return withRetry(
+    () => withFallback(
+      (horizon) => horizon.effects().forTransaction(transactionHash).limit(200).call(),
+      'claimableBalanceEffects',
+    ),
+    { maxAttempts: 3, label: 'claimableBalanceEffects' },
+  );
+}
+
+async function getClaimableBalanceIdForTransaction(transactionHash) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const effects = await getEffectsForTransaction(transactionHash);
+    const createdEffect = effects.records?.find(
+      (effect) => effect.type === 'claimable_balance_created' && effect.balance_id,
+    );
+    if (createdEffect) return createdEffect.balance_id;
+    if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 200 * (2 ** attempt)));
+  }
+
+  const error = new Error(`Horizon did not return a claimable balance ID for transaction ${transactionHash}`);
+  error.status = 502;
+  throw error;
+}
+
+function getClaimableBalanceExpiry(balance) {
+  const visitPredicate = (predicate) => {
+    if (!predicate || typeof predicate !== 'object') return null;
+    if (predicate.abs_before) {
+      const expiresAt = new Date(predicate.abs_before);
+      return Number.isNaN(expiresAt.getTime()) ? null : expiresAt;
+    }
+    for (const key of ['not', 'and', 'or']) {
+      const children = Array.isArray(predicate[key]) ? predicate[key] : [predicate[key]];
+      for (const child of children) {
+        const expiresAt = visitPredicate(child);
+        if (expiresAt) return expiresAt;
+      }
+    }
+    return null;
+  };
+
+  for (const claimant of balance.claimants || []) {
+    let predicate = claimant.predicate;
+    if (typeof predicate === 'string') {
+      try { predicate = JSON.parse(predicate); } catch { continue; }
+    }
+    const expiresAt = visitPredicate(predicate);
+    if (expiresAt) return expiresAt;
+  }
+  return null;
+}
+
+async function getClaimableBalanceRecord(balanceId) {
+  return withRetry(
+    () => withFallback(
+      (horizon) => horizon.claimableBalances().claimableBalance(balanceId).call(),
+      'claimableBalanceRecord',
+    ),
+    { maxAttempts: 2, label: 'claimableBalanceRecord' },
+  );
+}
+
 async function createClaimableBalance({
   senderPublicKey,
   encryptedSecretKey,
@@ -488,6 +555,12 @@ async function createClaimableBalance({
   const assetObj = resolveAsset(asset);
   const secretKey = decryptPrivateKey(encryptedSecretKey);
   const senderKeypair = StellarSdk.Keypair.fromSecret(secretKey);
+  const expiresAt = new Date(
+    Math.floor((Date.now() + CLAIMABLE_BALANCE_EXPIRY_DAYS * 24 * 60 * 60 * 1000) / 1000) * 1000,
+  );
+  const expiryPredicate = StellarSdk.Claimant.predicateBeforeAbsoluteTime(
+    String(Math.floor(expiresAt.getTime() / 1000)),
+  );
   const rawAccount = await withRetry(() => withFallback(s => s.loadAccount(senderPublicKey), logger), { label: 'loadAccount(sender)' });
   const senderAccount = validateHorizonResponse(AccountResponseSchema, rawAccount, 'loadAccount(sender)');
 
@@ -499,7 +572,8 @@ async function createClaimableBalance({
       asset: assetObj,
       amount: String(amount),
       claimants: [
-        new StellarSdk.Claimant(recipientPublicKey, StellarSdk.Claimant.predicateUnconditional())
+        new StellarSdk.Claimant(recipientPublicKey, expiryPredicate),
+        new StellarSdk.Claimant(senderPublicKey, StellarSdk.Claimant.predicateNot(expiryPredicate)),
       ]
     }))
     .setTimeout(30);
@@ -512,7 +586,14 @@ async function createClaimableBalance({
 
   const rawResult = await withRetry(() => withFallback(s => s.submitTransaction(transaction), logger), { label: 'submitTransaction' });
   const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(claimableBalance)');
-  return { transactionHash: result.hash, ledger: result.ledger };
+  const claimableBalanceId = await getClaimableBalanceIdForTransaction(result.hash);
+  return {
+    transactionHash: result.hash,
+    ledger: result.ledger,
+    claimableBalanceId,
+    expiresAt,
+    claimableAmount: String(amount),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +719,13 @@ async function _sendPaymentOnce({
         { label: 'submitTransaction(payment)' }
       );
       const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(payment)');
-      return { transactionHash: result.hash, ledger: result.ledger, type: 'payment' };
+      return {
+        transactionHash: result.hash,
+        ledger: result.ledger,
+        type: 'payment',
+        successful: result.successful,
+        maxTime: transaction.timeBounds?.maxTime,
+      };
     } catch (err) {
       if (isBadSeq(err) && attempt < MAX_SEQ_RETRIES - 1) {
         logger.warn('tx_bad_seq detected, retrying with fresh sequence number', {
@@ -1060,7 +1147,12 @@ async function sendPathPayment({
       () => withFallback(s => s.submitTransaction(transaction), 'submitTransaction'),
       { label: 'submitTransaction(pathPayment)' }
     );
-    return { transactionHash: result.hash, ledger: result.ledger };
+    return {
+      transactionHash: result.hash,
+      ledger: result.ledger,
+      successful: result.successful,
+      maxTime: transaction.timeBounds?.maxTime,
+    };
   }, senderPublicKey, senderKeypair);
 }
 
@@ -1117,7 +1209,12 @@ async function sendStrictReceivePathPayment({
 
   const rawResult = await withFallback(s => s.submitTransaction(transaction));
   const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(strictReceive)');
-  return { transactionHash: result.hash, ledger: result.ledger };
+  return {
+    transactionHash: result.hash,
+    ledger: result.ledger,
+    successful: result.successful,
+    maxTime: transaction.timeBounds?.maxTime,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,6 +1747,10 @@ module.exports = {
   validateBatchRecipient,
   resolveFederationAddress,
   createClaimableBalance,
+  getClaimableBalanceIdForTransaction,
+  getEffectsForTransaction,
+    getClaimableBalanceExpiry,
+  getClaimableBalanceRecord,
   addTrustline,
   removeTrustline,
   getTrustlines,
@@ -1665,6 +1766,7 @@ module.exports = {
   setAccountFlags,
   findReceivePath,
   sendStrictReceivePathPayment,
+  withFallback,
   isBadSeq,
   recoverSequence,
   withSequenceRecovery,
