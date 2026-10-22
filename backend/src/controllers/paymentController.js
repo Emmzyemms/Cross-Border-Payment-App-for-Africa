@@ -37,6 +37,63 @@ const KYC_THRESHOLD_USD = parseFloat(process.env.KYC_THRESHOLD_USD || "100");
 
 const FALLBACK_PLATFORM_FEE_BPS = parseInt(process.env.PLATFORM_FEE_BPS || "250", 10);
 
+function decodeHistoryCursor(cursor) {
+  if (typeof cursor !== "string" || !/^[A-Za-z0-9_-]+$/.test(cursor)) return null;
+
+  try {
+    const decoded = Buffer.from(cursor, "base64url");
+    if (decoded.toString("base64url") !== cursor) return null;
+    const value = JSON.parse(decoded.toString("utf8"));
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.created_at !== "string" ||
+      !Number.isFinite(Date.parse(value.created_at)) ||
+      typeof value.id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.id)
+    ) return null;
+    return { created_at: value.created_at, id: value.id };
+  } catch (_) {
+    return null;
+  }
+}
+
+function encodeHistoryCursor(createdAt, id) {
+  const timestamp = createdAt instanceof Date ? createdAt.toISOString() : String(createdAt);
+  return Buffer.from(JSON.stringify({ created_at: timestamp, id }), "utf8").toString("base64url");
+}
+
+/**
+ * Build the structured fee breakdown for a payment.
+ * @param {string|number} grossAmount  - Amount the sender sent
+ * @param {string}        asset        - e.g. "USDC" or "XLM"
+ * @param {string|null}   feeCharged   - Stellar fee_charged in stroops (from Horizon result)
+ */
+async function buildFeeBreakdown(grossAmount, asset, feeCharged) {
+  const gross = parseFloat(grossAmount);
+  let feeBps = FALLBACK_PLATFORM_FEE_BPS;
+  try {
+    const cfg = await getActiveConfig('platform', asset);
+    if (cfg) feeBps = cfg.fee_bps;
+  } catch (_) {
+    // fall back to env var if cache/DB is unavailable
+  }
+  const platformFee = parseFloat((gross * feeBps / 10000).toFixed(7));
+  const stellarBaseFeeXlm = feeCharged != null
+    ? parseFloat((parseInt(feeCharged, 10) / 1e7).toFixed(7))
+    : null;
+  const netAmount = parseFloat((gross - platformFee).toFixed(7));
+
+  return {
+    gross_amount_usdc: parseFloat(gross.toFixed(7)),
+    platform_fee_bps: feeBps,
+    platform_fee_usdc: platformFee,
+    stellar_base_fee_xlm: stellarBaseFeeXlm,
+    net_amount_usdc: parseFloat(netAmount.toFixed(7)),
+    asset,
+  };
+}
+
 // Approximate XLM/USD rate  in production replace with a live price feed
 const XLM_USD_RATE = parseFloat(process.env.XLM_USD_RATE || "0.11");
 
@@ -436,6 +493,7 @@ async function send(req, res, next) {
       const netAmount = fee_breakdown.net_amount_usdc;
 
       // Broadcast to Stellar - send net amount to recipient
+      const { transactionHash, ledger, type, claimableBalanceId, expiresAt, claimableAmount, feeCharged } = await sendPayment({
       const { transactionHash, ledger, type, claimableBalanceId, feeCharged, successful, maxTime } = await sendPayment({
         senderPublicKey: public_key,
         encryptedSecretKey: encrypted_secret_key,
@@ -453,6 +511,28 @@ async function send(req, res, next) {
       const updated_fee_breakdown = withStellarFee(fee_breakdown, feeCharged);
 
       // Save to DB
+      const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
+      const transactionParams = [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(updated_fee_breakdown)];
+      if (type === "claimable_balance") {
+        await db.query(
+          `WITH inserted_transaction AS (
+             INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             RETURNING id
+           )
+           INSERT INTO claimable_balances (balance_id, user_id, asset, amount, claimant_wallet, expires_at)
+           SELECT $16, $17, $5, $18, $3, $19
+           FROM inserted_transaction
+           ON CONFLICT (balance_id) DO NOTHING`,
+          [...transactionParams, claimableBalanceId, req.user.userId, claimableAmount, expiresAt],
+        );
+      } else {
+        await db.query(
+          `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          transactionParams,
+        );
+      }
       const txStatus = type === "claimable_balance"
         ? "pending_claim"
         : successful === false ? "failed" : "completed";
@@ -463,7 +543,7 @@ async function send(req, res, next) {
         [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(updated_fee_breakdown), updated_fee_breakdown.platform_fee_amount, txStatus === "completed" || txStatus === "failed" ? new Date() : null, confirmationExpiresAt],
       );
 
-      txResult = { transactionHash, ledger, type, claimableBalanceId, fee_breakdown: updated_fee_breakdown, txStatus };
+      txResult = { transactionHash, ledger, type, claimableBalanceId, expiresAt, fee_breakdown: updated_fee_breakdown, txStatus };
     });
 
     if (!lockAcquired) {
@@ -537,6 +617,7 @@ async function send(req, res, next) {
         recipient: recipient_address,
         type: txResult.type,
         claimableBalanceId: txResult.claimableBalanceId,
+        claimableBalanceExpiresAt: txResult.expiresAt || null,
         fee_breakdown: txResult.fee_breakdown,
       },
     });
@@ -715,7 +796,14 @@ async function sendBatch(req, res, next) {
 async function history(req, res, next) {
   try {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-    const cursor = req.query.cursor ? parseInt(req.query.cursor, 10) : null;
+    const cursorValue = req.query.cursor;
+    const cursor = cursorValue == null ? null : decodeHistoryCursor(cursorValue);
+    if (cursorValue != null && !cursor) return res.status(400).json({ error: "Invalid cursor" });
+
+    const walletId = req.query.wallet_id || null;
+    if (walletId && (typeof walletId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(walletId))) {
+      return res.status(400).json({ error: "Invalid wallet_id" });
+    }
 
     let fromBound = null;
     let toBound = null;
@@ -743,10 +831,12 @@ async function history(req, res, next) {
       if (!assetFilter) return res.status(400).json({ error: "Invalid asset filter" });
     }
 
-    const walletResult = await db.query(
-      "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
-      [req.user.userId],
-    );
+    const walletResult = walletId
+      ? await db.query("SELECT public_key FROM wallets WHERE user_id = $1 AND id = $2", [req.user.userId, walletId])
+      : await db.query(
+        "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
+        [req.user.userId],
+      );
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
     const { public_key } = walletResult.rows[0];
@@ -765,8 +855,8 @@ async function history(req, res, next) {
     const baseParams = [public_key];
 
     if (cursor) {
-      conditions.push(`id < $${baseParams.length + 1}`);
-      baseParams.push(cursor);
+      conditions.push(`(created_at, id) < ($${baseParams.length + 1}::timestamptz, $${baseParams.length + 2}::uuid)`);
+      baseParams.push(cursor.created_at, cursor.id);
     }
     if (fromBound) {
       conditions.push(`created_at >= $${baseParams.length + 1}`);
@@ -782,21 +872,24 @@ async function history(req, res, next) {
     }
     const whereClause = conditions.join(" AND ");
 
-    const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, ledger_close_time, fee_breakdown
+      const listSql = `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, created_at, created_at::text AS cursor_created_at, ledger_close_time, fee_breakdown
          FROM transactions
          WHERE ${whereClause}
-         ORDER BY id DESC LIMIT $${baseParams.length + 1}`;
+         ORDER BY created_at DESC, id DESC LIMIT $${baseParams.length + 1}`;
 
     const result = await db.query(listSql, [...baseParams, limit + 1]);
 
     const rows = result.rows;
     const hasMore = rows.length > limit;
-    const transactions = rows.slice(0, limit).map((tx) => ({
+    const transactions = rows.slice(0, limit).map(({ cursor_created_at, ...tx }) => ({
       ...tx,
       direction: tx.sender_wallet === public_key ? "sent" : "received",
     }));
 
-    const next_cursor = hasMore ? transactions[transactions.length - 1].id : null;
+    const lastRow = rows[limit - 1];
+    const next_cursor = hasMore
+      ? encodeHistoryCursor(lastRow.cursor_created_at || lastRow.created_at, lastRow.id)
+      : null;
     res.json({ transactions, next_cursor, has_more: hasMore });
   } catch (err) {
     next(err);

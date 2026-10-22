@@ -185,8 +185,14 @@ router.get(
  *       - in: query
  *         name: cursor
  *         schema:
- *           type: integer
- *         description: Pagination cursor (last transaction id)
+ *           type: string
+ *         description: Opaque cursor returned by the previous page
+ *       - in: query
+ *         name: wallet_id
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Wallet to query; must belong to the authenticated user
  *     responses:
  *       200:
  *         description: List of transactions
@@ -205,6 +211,7 @@ router.get(
       .trim()
       .isIn(ALLOWED_HISTORY_ASSETS)
       .withMessage(`asset must be one of: ${ALLOWED_HISTORY_ASSETS.join(", ")}`),
+    query("wallet_id").optional().isUUID().withMessage("wallet_id must be a valid UUID"),
     query("direction")
       .optional({ values: "falsy" })
       .isIn(["sent", "received", "all"])
