@@ -14,7 +14,6 @@ const {
   findReceivePath,
   sendStrictReceivePathPayment,
   getBalance,
-  getAssetContractAddress,
 } = require("../services/stellar");
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
@@ -27,7 +26,7 @@ const { isMemoRequired } = require("../services/memoRequired");
 const { awardReferralCredit } = require("./referralController");
 const { enqueueMint } = require("../services/loyaltyMintQueue");
 const { creditReferralReward } = require("../services/referralRewardService");
-const { depositFee } = require("../services/feeDistributor");
+const { buildFeeBreakdown, collectPlatformFee, withStellarFee } = require("../services/fees");
 const { getActiveConfig } = require("../services/feeConfigService");
 const logger = require("../utils/logger");
 const { cancelEscrow } = require("../services/agentEscrow");
@@ -219,11 +218,13 @@ async function insertTransactionRecord({
   tx_hash = null,
   status,
   ledger_close_time = null,
+  fee_amount = 0,
+  fee_breakdown = null,
 }) {
   await db.query(
-    `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, ledger_close_time)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, ledger_close_time],
+    `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, ledger_close_time, fee_amount, fee_breakdown)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, ledger_close_time, fee_amount, fee_breakdown ? JSON.stringify(fee_breakdown) : null],
   );
   return id;
 }
@@ -304,6 +305,8 @@ async function estimateFees(req, res, next) {
     breakdown.platform_fee_bps = feeBps;
     breakdown.platform_fee_usdc = parseFloat((parseFloat(amount) * feeBps / 10000).toFixed(7));
     breakdown.net_amount_usdc = parseFloat((parseFloat(amount) - breakdown.platform_fee_usdc).toFixed(7));
+    breakdown.platform_fee_amount = breakdown.platform_fee_usdc;
+    breakdown.net_amount = breakdown.net_amount_usdc;
 
     res.json({
       fee_breakdown: breakdown,
@@ -488,10 +491,10 @@ async function send(req, res, next) {
       // Calculate fee before sending payment
       const fee_breakdown = await buildFeeBreakdown(amount, asset, null); // We'll update with actual stellar fee later
       const netAmount = fee_breakdown.net_amount_usdc;
-      const platformFeeAmount = fee_breakdown.platform_fee_usdc;
 
       // Broadcast to Stellar - send net amount to recipient
       const { transactionHash, ledger, type, claimableBalanceId, expiresAt, claimableAmount, feeCharged } = await sendPayment({
+      const { transactionHash, ledger, type, claimableBalanceId, feeCharged, successful, maxTime } = await sendPayment({
         senderPublicKey: public_key,
         encryptedSecretKey: encrypted_secret_key,
         recipientPublicKey: recipient_address,
@@ -505,7 +508,7 @@ async function send(req, res, next) {
       const ledger_close_time = await fetchLedgerCloseTime(ledger);
 
       // Update fee breakdown with actual stellar fee
-      const updated_fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
+      const updated_fee_breakdown = withStellarFee(fee_breakdown, feeCharged);
 
       // Save to DB
       const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
@@ -530,6 +533,15 @@ async function send(req, res, next) {
           transactionParams,
         );
       }
+      const txStatus = type === "claimable_balance"
+        ? "pending_claim"
+        : successful === false ? "failed" : "completed";
+      const confirmationExpiresAt = maxTime ? new Date(Number(maxTime) * 1000) : null;
+      await db.query(
+        `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown, fee_amount, confirmed_at, confirmation_expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(updated_fee_breakdown), updated_fee_breakdown.platform_fee_amount, txStatus === "completed" || txStatus === "failed" ? new Date() : null, confirmationExpiresAt],
+      );
 
       txResult = { transactionHash, ledger, type, claimableBalanceId, expiresAt, fee_breakdown: updated_fee_breakdown, txStatus };
     });
@@ -540,10 +552,6 @@ async function send(req, res, next) {
         error: "Too many concurrent payment requests. Please try again.",
         code: "CONCURRENCY_LIMIT",
       });
-    }
-
-    if (txResult.type !== "claimable_balance") {
-      pollTransactionConfirmation(txId, txResult.transactionHash).catch(() => {});
     }
 
     await cache.del(`balance:${public_key}`);
@@ -560,15 +568,7 @@ async function send(req, res, next) {
       logger.error('Failed to enqueue loyalty mint', { userId: req.user.userId, error: err.message });
     });
 
-    if (asset === "USDC" && txResult.fee_breakdown.platform_fee_bps > 0) {
-      const feeStroops = Math.floor(txResult.fee_breakdown.platform_fee_usdc * 1e7);
-      if (feeStroops > 0) {
-        const usdcContractAddress = getAssetContractAddress("USDC");
-        depositFee(feeStroops, usdcContractAddress, public_key).catch((err) =>
-          logger.error("Fee deposit failed:", { error: err.message, feeStroops, usdcContractAddress }),
-        );
-      }
-    }
+    collectPlatformFee(txResult.fee_breakdown, public_key);
 
     const txData = { id: txId, tx_hash: txResult.transactionHash, ledger: txResult.ledger, amount, asset, sender: public_key, recipient: recipient_address, type: txResult.type };
     webhook.deliver("payment.sent", req.user.userId, txData).catch(() => {});
@@ -712,8 +712,9 @@ async function sendBatch(req, res, next) {
 
       try {
         await validateBatchRecipient({ recipientPublicKey: recipientAddress, asset });
-        results.push({ index, recipient_address: recipientAddress, amount, status: "pending" });
-        validRecipients.push({ index, recipientPublicKey: recipientAddress, amount });
+        const fee_breakdown = await buildFeeBreakdown(amount, asset);
+        results.push({ index, recipient_address: recipientAddress, amount, status: "pending", fee_breakdown });
+        validRecipients.push({ index, recipientPublicKey: recipientAddress, amount: fee_breakdown.net_amount, fee_breakdown });
       } catch (err) {
         results.push({ index, recipient_address: recipientAddress, amount, status: "failed", error: err.message });
       }
@@ -744,6 +745,8 @@ async function sendBatch(req, res, next) {
           sender_wallet: public_key, recipient_wallet: result.recipient_address,
           amount: result.amount, asset, memo: memo || null, memo_type,
           tx_hash: result.tx_hash || null, status: result.status === "success" ? "completed" : "failed",
+          fee_amount: result.status === "success" ? result.fee_breakdown.platform_fee_amount : 0,
+          fee_breakdown: result.status === "success" ? result.fee_breakdown : null,
         });
         result.id = txId;
         if (result.status === "success") {
@@ -752,6 +755,9 @@ async function sendBatch(req, res, next) {
           webhook.deliver("payment.received", req.user.userId, txData).catch(() => {});
         }
       }));
+
+      const batchFeeTotal = validRecipients.reduce((total, recipient) => total + recipient.fee_breakdown.platform_fee_amount, 0);
+      collectPlatformFee({ asset, platform_fee_amount: batchFeeTotal }, public_key);
 
       await cache.del(`balance:${public_key}`);
       return res.json({
@@ -976,19 +982,21 @@ async function sendPath(req, res, next) {
     // Balance check — fail fast with a clear message before hitting Stellar
     await checkSufficientBalance(public_key, source_amount, source_asset);
 
-    const { transactionHash, ledger } = await sendPathPayment({
+    const fee_breakdown = await buildFeeBreakdown(source_amount, source_asset);
+    const { transactionHash, ledger, successful, maxTime } = await sendPathPayment({
       senderPublicKey: public_key, encryptedSecretKey: encrypted_secret_key,
-      recipientPublicKey: recipient_address, sourceAsset: source_asset, sourceAmount: source_amount,
+      recipientPublicKey: recipient_address, sourceAsset: source_asset, sourceAmount: fee_breakdown.net_amount,
       destinationAsset: destination_asset, destinationMinAmount: destination_min_amount, path, memo: memoStr,
     }, req.logger);
 
+    const txStatus = successful === false ? "failed" : "completed";
+    const confirmationExpiresAt = maxTime ? new Date(Number(maxTime) * 1000) : null;
     await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, request_id, is_encrypted, encrypted_memo)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'confirming',$8,$9,$10)`,
-      [txId, public_key, recipient_address, source_amount, source_asset, memoStr || null, transactionHash, req.requestId, is_encrypted, encrypted_memo],
+      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, request_id, is_encrypted, encrypted_memo, confirmed_at, confirmation_expires_at, fee_amount, fee_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [txId, public_key, recipient_address, source_amount, source_asset, memoStr || null, transactionHash, txStatus, req.requestId, is_encrypted, encrypted_memo, new Date(), confirmationExpiresAt, fee_breakdown.platform_fee_amount, JSON.stringify(fee_breakdown)],
     );
-
-    pollTransactionConfirmation(txId, transactionHash).catch(() => {});
+    collectPlatformFee(fee_breakdown, public_key);
 
     // Invalidate sender's cached balance after successful path payment
     await cache.del(`balance:${public_key}`);
@@ -999,7 +1007,7 @@ async function sendPath(req, res, next) {
 
     res.json({
       message: "Path payment sent successfully",
-      transaction: { id: txId, tx_hash: transactionHash, ledger, source_amount, source_asset, destination_asset, recipient: recipient_address },
+      transaction: { id: txId, tx_hash: transactionHash, ledger, source_amount, source_asset, destination_asset, recipient: recipient_address, status: txStatus },
     });
   } catch (err) {
     if (public_key) {
@@ -1092,19 +1100,21 @@ async function sendStrictReceivePath(req, res, next) {
       return res.status(429).json({ error: fraudCheck.reason });
     }
 
-    const { transactionHash, ledger } = await sendStrictReceivePathPayment({
+    const fee_breakdown = await buildFeeBreakdown(destination_amount, destination_asset);
+    const { transactionHash, ledger, successful, maxTime } = await sendStrictReceivePathPayment({
       senderPublicKey: public_key, encryptedSecretKey: encrypted_secret_key,
       recipientPublicKey: recipient_address, sourceAsset: source_asset, sourceMaxAmount: source_max_amount,
-      destinationAsset: destination_asset, destinationAmount: destination_amount, path, memo: memoStr,
+      destinationAsset: destination_asset, destinationAmount: fee_breakdown.net_amount, path, memo: memoStr,
     });
 
+    const txStatus = successful === false ? "failed" : "completed";
+    const confirmationExpiresAt = maxTime ? new Date(Number(maxTime) * 1000) : null;
     await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, request_id, is_encrypted, encrypted_memo)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'confirming',$8,$9,$10)`,
-      [txId, public_key, recipient_address, destination_amount, destination_asset, memoStr || null, transactionHash, req.requestId, is_encrypted, encrypted_memo],
+      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, request_id, is_encrypted, encrypted_memo, confirmed_at, confirmation_expires_at, fee_amount, fee_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+      [txId, public_key, recipient_address, destination_amount, destination_asset, memoStr || null, transactionHash, txStatus, req.requestId, is_encrypted, encrypted_memo, new Date(), confirmationExpiresAt, fee_breakdown.platform_fee_amount, JSON.stringify(fee_breakdown)],
     );
-
-    pollTransactionConfirmation(txId, transactionHash).catch(() => {});
+    collectPlatformFee(fee_breakdown, public_key);
 
     const txData = { id: txId, tx_hash: transactionHash, ledger, destination_amount, destination_asset, sender: public_key, recipient: recipient_address };
     webhook.deliver("payment.sent", req.user.userId, txData).catch(() => {});
@@ -1112,7 +1122,7 @@ async function sendStrictReceivePath(req, res, next) {
 
     res.json({
       message: "Strict receive path payment sent successfully",
-      transaction: { id: txId, tx_hash: transactionHash, ledger, destination_amount, destination_asset, recipient: recipient_address, status: "confirming" },
+      transaction: { id: txId, tx_hash: transactionHash, ledger, destination_amount, destination_asset, recipient: recipient_address, status: txStatus },
     });
   } catch (err) {
     if (public_key) {
@@ -1126,34 +1136,6 @@ async function sendStrictReceivePath(req, res, next) {
     if (err.response?.data) return res.status(400).json({ error: "Strict receive path payment failed", details: err.response.data?.extras });
     next(err);
   }
-}
-
-async function pollTransactionConfirmation(txId, txHash) {
-  const StellarSdk = require("@stellar/stellar-sdk");
-  const pollServer = new StellarSdk.Horizon.Server(process.env.STELLAR_HORIZON_URL || "https://horizon-testnet.stellar.org");
-  const maxAttempts = 10;
-  const pollInterval = 2000;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const tx = await pollServer.transactions().transaction(txHash).call();
-      if (tx.successful) {
-        await db.query(`UPDATE transactions SET status = 'completed', confirmed_at = NOW() WHERE id = $1`, [txId]);
-        return;
-      } else {
-        await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
-        return;
-      }
-    } catch (err) {
-      if (err.response?.status === 404) {
-        await new Promise((resolve) => setTimeout(resolve, pollInterval));
-        continue;
-      }
-      await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
-      return;
-    }
-  }
-  await db.query(`UPDATE transactions SET status = 'failed', confirmed_at = NOW() WHERE id = $1`, [txId]);
 }
 
 const EXPORT_ROW_LIMIT = parseInt(process.env.EXPORT_ROW_LIMIT || "1000000", 10);
